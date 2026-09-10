@@ -2,6 +2,7 @@
 # License: Apache License, Version 2.0
 import time
 import threading
+import os
 from typing import Dict, List, Optional
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 from dds.dds_base import DDSObject
@@ -57,7 +58,11 @@ class DDSManager:
             return True
         
         try:
-            ChannelFactoryInitialize(1)
+            # Keep simulator low-level traffic on an explicitly selected
+            # interface. The motion pipeline sets this to loopback so lowcmd
+            # cannot reach a physical robot on the LAN.
+            domain = int(os.getenv("DDS_DOMAIN", "42"))
+            ChannelFactoryInitialize(domain, os.getenv("DDS_INTERFACE") or None)
             self.dds_initialized = True
             print("[DDSManager] DDS system initialized")
             return True

@@ -85,9 +85,12 @@ from dds.dds_master import dds_manager
 _g1_robot_dds = None
 _dds_initialized = False
 
-# 观测缓存：索引张量与DDS限速（50FPS）+ 预分配缓冲
+# Observation cache: preallocated joint buffers and simulation-tick DDS gating.
+# Physics remains 200 Hz while SONIC consumes one authoritative sample every
+# four physics ticks (50 Hz simulation time), independent of wall-time RTF.
 _obs_cache = {
     "device": None,
+    "joint_contract": None,
     "batch": None,
     "boy_idx_t": None,
     "boy_idx_batch": None,
@@ -95,17 +98,27 @@ _obs_cache = {
     "vel_buf": None,
     "torque_buf": None,
     "combined_buf": None,
-    "dds_last_ms": 0,
-    "dds_min_interval_ms": 20,
+    "dds_last_step": None,
+    "dds_step_interval": 4,
 }
 
 # IMU 加速度缓存：用于通过速度差分计算加速度
-# IMU acceleration cache: for computing acceleration via velocity differentiation
-_imu_acc_cache = {
-    "prev_vel": None,
-    "dt": 0.01,
-    "initialized": False,
+# IMU acceleration caches: the G1 publishes independent pelvis and torso IMUs.
+# Sharing one previous-velocity sample between them corrupts both acceleration
+# estimates when the two sensors are sampled in the same physics step.
+def _new_imu_acc_cache():
+    return {
+        "prev_vel": None,
+        "dt": 0.01,
+        "initialized": False,
+    }
+
+
+_imu_acc_caches = {
+    "pelvis": _new_imu_acc_cache(),
+    "torso": _new_imu_acc_cache(),
 }
+_reported_torso_imu_body = False
 
 def _get_g1_robot_dds_instance():
     """get the DDS instance, delay initialization"""
@@ -142,6 +155,8 @@ def _get_g1_robot_dds_instance():
 def get_robot_boy_joint_states(
     env: ManagerBasedRLEnv,
     enable_dds: bool = True,
+    joint_name_map: dict[str, str] | None = None,
+    joint_axis_signs: dict[str, int] | None = None,
 ) -> torch.Tensor:
     """get the robot body joint states, positions and velocities
     
@@ -164,10 +179,37 @@ def get_robot_boy_joint_states(
 
     # 预计算并缓存索引张量（列索引）
     global _obs_cache
-    if _obs_cache["device"] != device or _obs_cache["boy_idx_t"] is None:
-        boy_joint_indices = [0, 3, 6, 9, 13, 17, 1, 4, 7, 10, 14, 18, 2, 5, 8, 11, 15, 19, 21, 23, 25, 27, 12, 16, 20, 22, 24, 26, 28]
+    boy_joint_names = get_robot_boy_joint_names()
+    if joint_name_map is None:
+        joint_name_map = {name: name for name in boy_joint_names}
+    if joint_axis_signs is None:
+        joint_axis_signs = {name: 1 for name in boy_joint_names}
+    joint_contract = tuple(
+        (name, joint_name_map[name], int(joint_axis_signs[name]))
+        for name in boy_joint_names
+    )
+    if (
+        _obs_cache["device"] != device
+        or _obs_cache["boy_idx_t"] is None
+        or _obs_cache["joint_contract"] != joint_contract
+    ):
+        # Resolve against the loaded USD instead of assuming one particular
+        # Isaac articulation order. The output order is the Unitree 29-DOF
+        # motor order returned by get_robot_boy_joint_names().
+        all_joint_names = env.scene["robot"].data.joint_names
+        asset_joint_names = [joint_name_map[name] for name in boy_joint_names]
+        missing = [name for name in asset_joint_names if name not in all_joint_names]
+        if missing:
+            raise ValueError(f"G1 articulation is missing body joints: {missing}")
+        boy_joint_indices = [all_joint_names.index(name) for name in asset_joint_names]
         _obs_cache["boy_idx_t"] = torch.tensor(boy_joint_indices, dtype=torch.long, device=device)
+        _obs_cache["axis_sign_t"] = torch.tensor(
+            [joint_axis_signs[name] for name in boy_joint_names],
+            dtype=joint_pos.dtype,
+            device=device,
+        )
         _obs_cache["device"] = device
+        _obs_cache["joint_contract"] = joint_contract
         _obs_cache["batch"] = None  # force re-init batch-shaped buffers
 
     idx_t = _obs_cache["boy_idx_t"]
@@ -198,6 +240,14 @@ def get_robot_boy_joint_states(
         vel_buf.copy_(torch.gather(joint_vel, 1, idx_batch))
         torque_buf.copy_(torch.gather(joint_torque, 1, idx_batch))
 
+    # Convert asset-native coordinates/torques to the explicit Unitree motor
+    # contract before publishing LowState.  Torque transforms with the same
+    # sign because virtual work must remain invariant.
+    signs = _obs_cache["axis_sign_t"].unsqueeze(0)
+    pos_buf.mul_(signs)
+    vel_buf.mul_(signs)
+    torque_buf.mul_(signs)
+
     # 组合为一个缓冲，避免 cat 分配
     combined_buf[:, 0:n].copy_(pos_buf)
     combined_buf[:, n:2*n].copy_(vel_buf)
@@ -206,20 +256,41 @@ def get_robot_boy_joint_states(
     # write to DDS（限速发布，避免高频CPU拷贝）
     if enable_dds and combined_buf.shape[0] > 0:
         try:
-            import time
-            now_ms = int(time.time() * 1000)
-            if now_ms - _obs_cache["dds_last_ms"] >= _obs_cache["dds_min_interval_ms"]:
+            sim_step = int(env.common_step_counter)
+            last_step = _obs_cache["dds_last_step"]
+            if last_step is None or sim_step - last_step >= _obs_cache["dds_step_interval"]:
                 g1_robot_dds = _get_g1_robot_dds_instance()
                 if g1_robot_dds:
-                    imu_data = get_robot_imu_data(env)
-                    if imu_data.shape[0] > 0:
+                    sample_interval = _obs_cache["dds_step_interval"]
+                    base_imu_data = get_robot_imu_data(
+                        env,
+                        use_torso_imu=False,
+                        sample_interval_steps=sample_interval,
+                    )
+                    torso_imu_data = get_robot_imu_data(
+                        env,
+                        use_torso_imu=True,
+                        sample_interval_steps=sample_interval,
+                    )
+                    if base_imu_data.shape[0] > 0 and torso_imu_data.shape[0] > 0:
+                        packed = torch.cat(
+                            (
+                                pos_buf[0],
+                                vel_buf[0],
+                                torque_buf[0],
+                                base_imu_data[0],
+                                torso_imu_data[0],
+                            )
+                        ).contiguous().cpu().numpy()
                         g1_robot_dds.write_robot_state(
-                            pos_buf[0].contiguous().cpu().numpy(),
-                            vel_buf[0].contiguous().cpu().numpy(),
-                            torque_buf[0].contiguous().cpu().numpy(),
-                            imu_data[0].contiguous().cpu().numpy(),
+                            packed[0:29],
+                            packed[29:58],
+                            packed[58:87],
+                            packed[87:100],
+                            torso_imu_data=packed[100:113],
+                            sim_step=sim_step,
                         )
-                        _obs_cache["dds_last_ms"] = now_ms
+                        _obs_cache["dds_last_step"] = sim_step
         except Exception as e:
             print(f"[g1_state] Error writing robot state to DDS: {e}")
     
@@ -297,7 +368,63 @@ def ensure_quat_w_first(quat, assume_w_first=None):
     # ambiguous: default to w-first but warn (can't print here reliably for all contexts)
     return quat
 
-def get_robot_imu_data(env, use_torso_imu: bool = True, quat_w_first: bool = None) -> torch.Tensor:
+
+@torch.jit.script
+def scripted_imu_sample(
+    pos: torch.Tensor,
+    quat_wxyz: torch.Tensor,
+    lin_vel: torch.Tensor,
+    ang_vel_world: torch.Tensor,
+    prev_vel: torch.Tensor,
+    dt: float,
+    initialized: bool,
+) -> torch.Tensor:
+    """Compute one IMU sample in a fused graph using known wxyz ordering."""
+
+    acceleration_world = (lin_vel - prev_vel) / dt
+    gravity_world = torch.zeros_like(acceleration_world)
+    gravity_world[:, 2] = -9.81
+    proper_acceleration_world = acceleration_world - gravity_world
+
+    # Isaac's quaternion maps body vectors to world.  Rotate world vectors
+    # into the body frame with the conjugate quaternion without constructing
+    # an intermediate 3x3 rotation matrix.
+    vector = quat_wxyz[:, 1:4]
+    scalar = quat_wxyz[:, 0:1]
+
+    accel_cross = torch.cross(vector, proper_acceleration_world, dim=1)
+    accel_second_cross = torch.cross(vector, accel_cross, dim=1)
+    acceleration_body = (
+        proper_acceleration_world
+        - 2.0 * scalar * accel_cross
+        + 2.0 * accel_second_cross
+    )
+    angular_cross = torch.cross(vector, ang_vel_world, dim=1)
+    angular_second_cross = torch.cross(vector, angular_cross, dim=1)
+    angular_velocity_body = (
+        ang_vel_world
+        - 2.0 * scalar * angular_cross
+        + 2.0 * angular_second_cross
+    )
+    if not initialized:
+        static_acceleration = -gravity_world
+        static_cross = torch.cross(vector, static_acceleration, dim=1)
+        static_second_cross = torch.cross(vector, static_cross, dim=1)
+        acceleration_body = (
+            static_acceleration
+            - 2.0 * scalar * static_cross
+            + 2.0 * static_second_cross
+        )
+    return torch.cat(
+        (pos, quat_wxyz, acceleration_body, angular_velocity_body), dim=1
+    )
+
+def get_robot_imu_data(
+    env,
+    use_torso_imu: bool = True,
+    quat_w_first: bool = None,
+    sample_interval_steps: int = 1,
+) -> torch.Tensor:
     """
     Returns [batch, 13] = pos(world,3) | quat(w,x,y,z) | acc_body(3) | gyro_body(3)
     - accel/gyro are in IMU/body frame (proper accelerometer reading)
@@ -305,10 +432,11 @@ def get_robot_imu_data(env, use_torso_imu: bool = True, quat_w_first: bool = Non
                     if False assume input quat is (x,y,z,w)
     """
     data = env.scene["robot"].data
-    global _imu_acc_cache
+    cache_key = "torso" if use_torso_imu else "pelvis"
+    imu_acc_cache = _imu_acc_caches[cache_key]
 
     # --- dt ---
-    dt = _imu_acc_cache["dt"]
+    dt = imu_acc_cache["dt"]
     try:
         if hasattr(env, "physics_dt"):
             dt = float(env.physics_dt)
@@ -319,21 +447,37 @@ def get_robot_imu_data(env, use_torso_imu: bool = True, quat_w_first: bool = Non
     except Exception:
         pass
     if dt <= 0:
-        dt = _imu_acc_cache["dt"]
+        dt = imu_acc_cache["dt"]
+    dt *= max(1, int(sample_interval_steps))
 
     # --- extract pose & vel ---
     if use_torso_imu:
-        try:
-            body_names = data.body_names
-            imu_idx = body_names.index("imu_in_torso")
+        body_names = data.body_names
+        # The official URDF defines imu_in_torso as a fixed child of
+        # torso_link with identity rotation.  Isaac's URDF importer commonly
+        # merges that massless fixed link, so it is absent from body_names.
+        # Falling back to the pelvis here makes the secondary IMU identical to
+        # the base IMU and removes the waist orientation observed by SONIC.
+        # torso_link has the exact sensor orientation and angular velocity;
+        # only the unused translational origin differs.
+        imu_body_name = next(
+            (name for name in ("imu_in_torso", "torso_link") if name in body_names),
+            None,
+        )
+        if imu_body_name is None:
+            use_torso_imu = False
+        else:
+            global _reported_torso_imu_body
+            if not _reported_torso_imu_body:
+                print(f"[g1_state] torso IMU kinematics source: {imu_body_name}")
+                _reported_torso_imu_body = True
+            imu_idx = body_names.index(imu_body_name)
             body_pose = data.body_link_pose_w  # [B, N, 7]
             body_vel = data.body_link_vel_w    # [B, N, 6]
             pos = body_pose[:, imu_idx, :3]
             quat = body_pose[:, imu_idx, 3:7]
             lin_vel = body_vel[:, imu_idx, :3]
             ang_vel_world = body_vel[:, imu_idx, 3:6]
-        except ValueError:
-            use_torso_imu = False
 
     if not use_torso_imu:
         root_state = data.root_state_w  # [B, 13]
@@ -342,52 +486,23 @@ def get_robot_imu_data(env, use_torso_imu: bool = True, quat_w_first: bool = Non
         lin_vel = root_state[:, 7:10]
         ang_vel_world = root_state[:, 10:13]
 
-    # device/dtype consistency
-    device = lin_vel.device if isinstance(lin_vel, torch.Tensor) else torch.device("cpu")
-    quat = quat.to(device)
-    lin_vel = lin_vel.to(device)
-    ang_vel_world = ang_vel_world.to(device)
+    device = lin_vel.device
+    if imu_acc_cache["prev_vel"] is None:
+        imu_acc_cache["prev_vel"] = lin_vel.detach().clone()
+        imu_acc_cache["initialized"] = False
+    elif imu_acc_cache["prev_vel"].device != device:
+        imu_acc_cache["prev_vel"] = imu_acc_cache["prev_vel"].to(device)
 
-    # initialize prev_vel if needed
-    if _imu_acc_cache["prev_vel"] is None:
-        _imu_acc_cache["prev_vel"] = lin_vel.clone().detach().to(device)
-        _imu_acc_cache["initialized"] = False
-    else:
-        if _imu_acc_cache["prev_vel"].device != device:
-            _imu_acc_cache["prev_vel"] = _imu_acc_cache["prev_vel"].to(device)
-
-    # compute a_world
-    a_world = (lin_vel - _imu_acc_cache["prev_vel"]) / dt  # [B,3]
-
-    # gravity in world frame (z-up convention)
-    g_world = torch.zeros_like(a_world)
-    g_world[:, 2] = -9.81
-
-    # subtract gravity (proper acceleration in world frame)
-    a_world_corrected = a_world - g_world  # [B,3]
-
-    # prepare quaternion in (w,x,y,z)
-    quat_wxyz = ensure_quat_w_first(quat, assume_w_first=True)
-
-    # build rotation matrices R_body->world ; to convert world->body use R^T
-    R_body_to_world = quat_to_rot_matrix(quat_wxyz)  # [B,3,3]
-    R_world_to_body = R_body_to_world.transpose(1, 2)  # [B,3,3]
-
-    # rotate a_world_corrected to body: a_body = R_world_to_body @ a_world_corrected
-    a_body = torch.bmm(R_world_to_body, a_world_corrected.unsqueeze(-1)).squeeze(-1)  # [B,3]
-
-    # rotate angular velocity to body frame as well (if ang_vel_world is indeed in world-frame)
-    omega_body = torch.bmm(R_world_to_body, ang_vel_world.unsqueeze(-1)).squeeze(-1)
-
-    # handle first frame: prefer returning only gravity-compensated static reading
-    if not _imu_acc_cache["initialized"]:
-        # set a_body to rotation of -g_world (so accelerometer reads gravity in body coords)
-        a_body = torch.bmm(R_world_to_body, (-g_world).unsqueeze(-1)).squeeze(-1)
-        _imu_acc_cache["initialized"] = True
-
-    # update cache
-    _imu_acc_cache["prev_vel"] = lin_vel.clone().detach()
-    _imu_acc_cache["dt"] = dt
-
-    imu_data = torch.cat([pos, quat_wxyz, a_body, omega_body], dim=1)
+    imu_data = scripted_imu_sample(
+        pos,
+        quat,
+        lin_vel,
+        ang_vel_world,
+        imu_acc_cache["prev_vel"],
+        dt,
+        bool(imu_acc_cache["initialized"]),
+    )
+    imu_acc_cache["prev_vel"] = lin_vel.detach().clone()
+    imu_acc_cache["initialized"] = True
+    imu_acc_cache["dt"] = dt
     return imu_data

@@ -26,7 +26,7 @@ from dds.dds_create import create_dds_objects,create_dds_objects_replay
 parser = argparse.ArgumentParser(description="Unitree Simulation")
 parser.add_argument("--task", type=str, default="Isaac-PickPlace-G129-Head-Waist-Fix", help="task name")
 parser.add_argument("--action_source", type=str, default="dds", 
-                   choices=["dds", "file", "trajectory", "policy", "replay","dds_wholebody"], 
+                   choices=["dds", "file", "trajectory", "policy", "replay","dds_wholebody", "sonic_dds"],
                    help="Action source")
 
 
@@ -53,6 +53,7 @@ parser.add_argument("--profile_interval", type=int, default=500, help="performan
 parser.add_argument("--model_path", type=str, default="assets/model/policy.onnx", help="model path")
 parser.add_argument("--reward_interval", type=int, default=10, help="step interval for reward calculation")
 parser.add_argument("--enable_wholebody_dds", action="store_true", default=False, help="enable wh dds")
+parser.add_argument("--sonic_command_timeout", type=float, default=0.25, help="seconds before a stale SONIC lowcmd returns to neutral")
 
 parser.add_argument("--physics_dt", type=float, default=None, help="physics time step, e.g., 0.005")
 parser.add_argument("--render_interval", type=int, default=None, help="render interval steps (>=1)")
@@ -406,7 +407,8 @@ def main():
     print(f"\ncreate action provider: {args_cli.action_source}...")
     try:
         print(f"args_cli.task: {args_cli.task}")
-        if not args_cli.replay_data and ("Wholebody" in args_cli.task or args_cli.enable_wholebody_dds):
+        if (not args_cli.replay_data and args_cli.action_source != "sonic_dds"
+                and ("Wholebody" in args_cli.task or args_cli.enable_wholebody_dds)):
             args_cli.action_source = "dds_wholebody"
             args_cli.enable_wholebody_dds = True
             control_config.use_rl_action_mode = True
@@ -533,6 +535,13 @@ def main():
                     recent_loop_times.pop(0)
                 
                 # execute control step (in main thread, support rendering)
+                # The original lowstate update is an observation side effect.
+                # A direct SONIC action source does not necessarily request
+                # that observation, so explicitly refresh the simulated G1
+                # state before the DDS publisher reads shared memory.
+                if args_cli.action_source == "sonic_dds":
+                    from tasks.common_observations.g1_29dof_state import get_robot_boy_joint_states
+                    get_robot_boy_joint_states(env, enable_dds=True)
                 controller.step()
 
                 # print statistics and loop frequency periodically
