@@ -1436,6 +1436,8 @@ def main() -> int:
         post_hold_ready_reported = False
         shutdown_requested = False
         completed_waiting_for_idle = False
+        preempt_support_hold = False
+        preempt_request: dict | None = None
         completed_performance: dict = {}
         active_report_path: Path | None = None
         active_shared_report_path: str | None = None
@@ -1911,6 +1913,58 @@ def main() -> int:
                             control_request = {}
                         if (
                             interactive_mode
+                            and control_request.get("state")
+                                == "REFERENCE_PREEMPT"
+                            and control_request.get("isaac_session_id") == session_id
+                            and (
+                                not preempt_support_hold
+                                or preempt_request is None
+                                or preempt_request.get("request_id")
+                                    != control_request.get("request_id")
+                            )
+                        ):
+                            # Offline references explicitly require the
+                            # bootstrap root band during frame-zero settling.
+                            # Reacquire it around the robot's current pose
+                            # before SONIC disables the joystick planner.
+                            preempt_support_hold = True
+                            preempt_request = control_request
+                            support_active = support_mode != "none"
+                            support_scale = 1.0 if support_active else 0.0
+                            support_attitude_scale = (
+                                1.0 if support_active else 0.0
+                            )
+                            support_release_step_target = None
+                            support_release_step = None
+                            support_stable_start_step = None
+                            support_fade_start_step = None
+                            fade_velocity_violation_steps = 0
+                            post_release_stable_start_step = None
+                            playback_gate_step = None
+                            elastic_target_w.copy_(
+                                robot.data.body_pos_w[:, pelvis_id]
+                            )
+                            bootstrap_phase = "REFERENCE_PREEMPT_SUPPORTED"
+                            write_runtime_status(
+                                "PREEMPT_SUPPORTED",
+                                request_id=control_request.get("request_id"),
+                                motion_id=control_request.get("motion_id"),
+                                bootstrap_phase=bootstrap_phase,
+                                elastic_support_scale=support_scale,
+                                elastic_support_attitude_scale=(
+                                    support_attitude_scale
+                                ),
+                                simulation_time_s=round(
+                                    step_count * sim_step_s, 4
+                                ),
+                            )
+                            print(
+                                "[pipeline-sim] elastic support reacquired "
+                                "for reference preemption",
+                                flush=True,
+                            )
+                        elif (
+                            interactive_mode
                             and control_request.get("state") == "SETTLING"
                             and control_request.get("isaac_session_id") == session_id
                         ):
@@ -1918,6 +1972,8 @@ def main() -> int:
                             # locomotion without restarting Isaac or SONIC. The
                             # regular SETTLING admission path runs next tick.
                             interactive_mode = False
+                            preempt_support_hold = False
+                            preempt_request = None
                             command_seen = False
                             active_request = None
                             playback_gate_step = None
@@ -2066,7 +2122,12 @@ def main() -> int:
                             reason=unsafe_reason,
                         )
                         break
-                    if support_active and provider.has_fresh_command and not DIAGNOSTIC_MODE:
+                    if (
+                        support_active
+                        and provider.has_fresh_command
+                        and not DIAGNOSTIC_MODE
+                        and not preempt_support_hold
+                    ):
                         if command_seen and support_release_step_target is None:
                             settle_steps = round(
                                 max(0.0, args_cli.release_delay) / sim_step_s
@@ -2547,7 +2608,9 @@ def main() -> int:
                                 else RuntimeState.READY.value
                             )
                         )
-                        if completed_waiting_for_idle:
+                        if preempt_support_hold and preempt_request is not None:
+                            runtime_state = "PREEMPT_SUPPORTED"
+                        elif completed_waiting_for_idle:
                             runtime_state = RuntimeState.COMPLETED.value
                         elif command_seen:
                             if interactive_mode:
@@ -2572,8 +2635,12 @@ def main() -> int:
                                 runtime_state = "EXECUTING"
                         write_runtime_status(
                             runtime_state,
-                            request_id=(active_request or {}).get("request_id"),
-                            motion_id=(active_request or {}).get("motion_id"),
+                            request_id=(
+                                preempt_request or active_request or {}
+                            ).get("request_id"),
+                            motion_id=(
+                                preempt_request or active_request or {}
+                            ).get("motion_id"),
                             report_path=(
                                 active_shared_report_path or shared_log_path
                             ),
@@ -2730,7 +2797,12 @@ def main() -> int:
                             ),
                             performance=completed_performance,
                         )
-                    if support_active and command_seen and not DIAGNOSTIC_MODE:
+                    if (
+                        support_active
+                        and command_seen
+                        and not DIAGNOSTIC_MODE
+                        and not preempt_support_hold
+                    ):
                         settle_elapsed_sim_s = (step_count - settle_start_step) * sim_step_s
                         if settle_elapsed_sim_s > args_cli.max_settle_duration:
                             unsafe_reason = (
