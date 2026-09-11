@@ -10,6 +10,7 @@ import json
 import math
 import os
 import queue
+import re
 import signal
 import sys
 import threading
@@ -36,6 +37,7 @@ from motion_pipeline.bootstrap_support import (
     elastic_support_scale,
     resolve_elastic_target_height,
 )
+from motion_pipeline.runtime_lifecycle import RuntimeState
 
 
 ASSET_PROFILE_DIR = MOTION_PIPELINE_ROOT / "config/asset_profiles"
@@ -1412,6 +1414,12 @@ def main() -> int:
         reference_playback_end_wall = None
         post_hold_ready_reported = False
         shutdown_requested = False
+        completed_waiting_for_idle = False
+        completed_performance: dict = {}
+        active_report_path: Path | None = None
+        active_shared_report_path: str | None = None
+        last_motion_id: str | None = None
+        execution_count = 0
         support_pose = robot.data.root_state_w[:, :7].clone()
         support_velocity = torch.zeros_like(robot.data.root_state_w[:, 7:13])
         pelvis_ids, _ = robot.find_bodies("pelvis")
@@ -1521,6 +1529,88 @@ def main() -> int:
         root_linear_velocity = [0.0, 0.0, 0.0]
         root_angular_velocity = [0.0, 0.0, 0.0]
 
+        def write_persistent_execution_report(finished_wall: float) -> dict:
+            """Finalize one command without closing the long-lived simulator."""
+
+            reference_duration_s = (
+                len(reference_joint_positions) / reference_hz
+                if reference_joint_positions and reference_hz > 0.0
+                else None
+            )
+            playback_wall_s = (
+                reference_playback_end_wall - playback_start_wall
+                if reference_playback_end_wall is not None
+                and playback_start_wall is not None
+                else None
+            )
+            performance = {
+                **runtime_performance_base,
+                "persistent_session": True,
+                "execution_index": execution_count,
+                "reference_duration_s": reference_duration_s,
+                "reference_playback_wall_s": playback_wall_s,
+                "unsupported_playback_realtime_factor": (
+                    reference_duration_s / playback_wall_s
+                    if reference_duration_s is not None
+                    and playback_wall_s is not None
+                    and playback_wall_s > 0.0
+                    else None
+                ),
+                "post_hold_wall_s": (
+                    max(0.0, finished_wall - reference_playback_end_wall)
+                    if reference_playback_end_wall is not None
+                    else None
+                ),
+                "settling_wall_s": (
+                    release_wall - settle_start_wall
+                    if release_wall is not None and settle_start_wall is not None
+                    else 0.0
+                ),
+                "settling_realtime_factor": release_realtime_factor,
+                "phase_latency": {
+                    name: summarize_ms(values)
+                    for name, values in phase_samples_ms.items()
+                },
+                "dds": g1_dds.performance_stats()
+                if hasattr(g1_dds, "performance_stats")
+                else None,
+                "lowcmd": provider.performance_stats()
+                if hasattr(provider, "performance_stats")
+                else None,
+                "trace": trace_writer.stats() if trace_writer is not None else None,
+                "report_trace_finalization_s": 0.0,
+                "video_finalization_s": None,
+            }
+            report = {
+                "schema_version": "1.0",
+                "task": TASK_NAME,
+                "asset_profile": ASSET_PROFILE.profile_id,
+                "asset_profile_contract": ASSET_PROFILE.runtime_contract(),
+                "asset_profile_qualified": ASSET_PROFILE.qualified,
+                "session_id": session_id,
+                "execution_index": execution_count,
+                "request_id": (active_request or {}).get("request_id"),
+                "motion_id": (active_request or {}).get("motion_id"),
+                "started_at": started_utc.isoformat(),
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "result": RuntimeState.COMPLETED.value,
+                "bootstrap_support_released": not support_active,
+                "bootstrap_support_mode": support_mode,
+                "bootstrap_phase": bootstrap_phase,
+                "trace_path": str(trace_path),
+                "performance": performance,
+                "samples": samples,
+            }
+            if active_report_path is None:
+                raise RuntimeError("persistent execution has no report path")
+            report_started = time.monotonic()
+            active_report_path.write_text(json.dumps(report, indent=2) + "\n")
+            performance["report_trace_finalization_s"] = (
+                time.monotonic() - report_started
+            )
+            active_report_path.write_text(json.dumps(report, indent=2) + "\n")
+            return performance
+
         if DIAGNOSTIC_MODE:
             print(
                 "[pipeline-sim] fixed-root LowCmd diagnostic endpoint ready; "
@@ -1542,7 +1632,7 @@ def main() -> int:
         }
         runtime_performance_base.update(startup_performance)
         write_runtime_status(
-            "DIAGNOSTIC_ONLY" if DIAGNOSTIC_MODE else "READY",
+            "DIAGNOSTIC_ONLY" if DIAGNOSTIC_MODE else RuntimeState.READY.value,
             report_path=shared_log_path,
             trace_path=shared_trace_path,
             render_interval=env_cfg.sim.render_interval,
@@ -1630,6 +1720,54 @@ def main() -> int:
                                 print(f"[pipeline-sim] UNSAFE: {unsafe_reason}")
                                 break
                             else:
+                                execution_count += 1
+                                command_slug = re.sub(
+                                    r"[^A-Za-z0-9_.-]+",
+                                    "_",
+                                    str(candidate.get("motion_id") or "motion"),
+                                )
+                                active_report_path = output_dir / (
+                                    f"isaac_{task_slug}_{run_id}_"
+                                    f"{execution_count:04d}_{command_slug}.json"
+                                )
+                                active_shared_report_path = (
+                                    "/motion_exchange/executions/"
+                                    + active_report_path.name
+                                )
+                                samples = []
+                                for latency_samples in phase_samples_ms.values():
+                                    latency_samples.clear()
+                                max_tracking_error = 0.0
+                                max_tracking_joint = None
+                                max_tracking_step = None
+                                max_command_position_error = 0.0
+                                max_command_position_joint = None
+                                max_command_position_step = None
+                                max_settling_joint_velocity = 0.0
+                                max_settling_joint_velocity_joint = None
+                                max_settling_torque_ratio = 0.0
+                                max_settling_torque_ratio_joint = None
+                                max_settling_target_rate = 0.0
+                                max_reference_root_height_error = 0.0
+                                max_reference_root_height_error_frame = None
+                                playback_start_step = None
+                                playback_start_wall = None
+                                playback_end_wall = None
+                                reference_playback_end_step = None
+                                reference_playback_end_wall = None
+                                post_hold_ready_reported = False
+                                shutdown_requested = False
+                                completed_waiting_for_idle = False
+                                completed_performance = {}
+                                playback_gate_step = None
+                                post_release_stable_start_step = None
+                                settle_start_wall = None
+                                settle_start_step = None
+                                release_wall = None
+                                release_realtime_factor = (
+                                    None if support_active else 1.0
+                                )
+                                unsafe_reason = None
                                 active_request = candidate
                                 try:
                                     reference_root_heights = [
@@ -1681,7 +1819,11 @@ def main() -> int:
                                 )
                                 settle_start_wall = now
                                 settle_start_step = step_count
-                                bootstrap_phase = "SUPPORTED_WARMUP"
+                                bootstrap_phase = (
+                                    "SUPPORTED_WARMUP"
+                                    if support_active
+                                    else "READY_STANDING"
+                                )
                                 provider.begin_control_handoff()
                                 write_runtime_status(
                                     "SETTLING",
@@ -1699,12 +1841,61 @@ def main() -> int:
                             control_request = json.loads(runtime_request_path.read_text())
                         except (FileNotFoundError, json.JSONDecodeError):
                             control_request = {}
-                        if control_request.get("state") == "ABORTED":
+                        if (
+                            completed_waiting_for_idle
+                            and control_request.get("state") == "IDLE"
+                            and active_request is not None
+                            and control_request.get("motion_id")
+                                == active_request.get("motion_id")
+                            and control_request.get("isaac_session_id") == session_id
+                        ):
+                            last_motion_id = str(active_request.get("motion_id"))
+                            completed_waiting_for_idle = False
+                            command_seen = False
+                            shutdown_requested = False
+                            active_request = None
+                            playback_start_step = None
+                            playback_start_wall = None
+                            playback_end_wall = None
+                            reference_playback_end_step = None
+                            reference_playback_end_wall = None
+                            reference_root_heights = []
+                            reference_joint_positions = []
+                            reference_joint_tensor = None
+                            expected_reference_root_height = None
+                            reference_root_height_error = None
+                            post_hold_ready_reported = False
+                            playback_gate_step = None
+                            post_release_stable_start_step = None
+                            bootstrap_phase = "READY_STANDING"
+                            write_runtime_status(
+                                RuntimeState.READY_STANDING.value,
+                                last_motion_id=last_motion_id,
+                                execution_count=execution_count,
+                                report_path=active_shared_report_path,
+                                trace_path=shared_trace_path,
+                                simulation_time_s=round(step_count * sim_step_s, 4),
+                                bootstrap_support_mode=support_mode,
+                                bootstrap_phase="READY_STANDING",
+                                performance=completed_performance,
+                            )
+                            print(
+                                "[pipeline-sim] same session returned to READY_STANDING "
+                                f"after motion={last_motion_id}",
+                                flush=True,
+                            )
+                        elif control_request.get("state") == "ABORTED":
                             result = "ABORTED"
                             unsafe_reason = "execution aborted by DDS control command"
                             print(f"[pipeline-sim] {unsafe_reason}")
+                            write_runtime_status(
+                                RuntimeState.SAFE_STOP.value,
+                                request_id=(active_request or {}).get("request_id"),
+                                motion_id=(active_request or {}).get("motion_id"),
+                                reason=unsafe_reason,
+                            )
                             break
-                        if (
+                        elif (
                             control_request.get("state") == "STOPPING"
                             and active_request is not None
                             and control_request.get("motion_id")
@@ -1712,6 +1903,8 @@ def main() -> int:
                         ):
                             shutdown_requested = True
                         if (
+                            not completed_waiting_for_idle
+                            and
                             control_request.get("state") == "PLAYING"
                             and playback_start_step is None
                             and active_request is not None
@@ -1759,6 +1952,24 @@ def main() -> int:
                         else:
                             result = "COMPLETED"
                             print("[pipeline-sim] SONIC command stream ended after approved execution")
+                        break
+                    if (
+                        not args_cli.exit_after_command
+                        and execution_count > 0
+                        and provider.command_is_stale
+                    ):
+                        result = "UNSAFE"
+                        unsafe_reason = (
+                            "persistent SONIC LowCmd stream became stale: "
+                            f"age={provider.command_age_s:.3f}s"
+                        )
+                        print(f"[pipeline-sim] UNSAFE: {unsafe_reason}")
+                        write_runtime_status(
+                            RuntimeState.SAFE_STOP.value,
+                            request_id=(active_request or {}).get("request_id"),
+                            motion_id=(active_request or {}).get("motion_id"),
+                            reason=unsafe_reason,
+                        )
                         break
                     if support_active and provider.has_fresh_command and not DIAGNOSTIC_MODE:
                         if command_seen and support_release_step_target is None:
@@ -2221,8 +2432,22 @@ def main() -> int:
                             f"cmd_err={command_position_error if command_position_error is not None else 0.0:.3f}rad"
                         )
                         next_stats = now + max(0.1, args_cli.stats_interval)
-                        runtime_state = "DIAGNOSTIC_ONLY" if DIAGNOSTIC_MODE else "READY"
-                        if command_seen:
+                        runtime_state = (
+                            "DIAGNOSTIC_ONLY"
+                            if DIAGNOSTIC_MODE
+                            else (
+                                RuntimeState.READY_STANDING.value
+                                if (
+                                    not support_active
+                                    and provider.has_fresh_command
+                                    and not provider.command_is_stale
+                                )
+                                else RuntimeState.READY.value
+                            )
+                        )
+                        if completed_waiting_for_idle:
+                            runtime_state = RuntimeState.COMPLETED.value
+                        elif command_seen:
                             if shutdown_requested:
                                 runtime_state = "STOPPING"
                             elif post_hold_ready_reported:
@@ -2237,7 +2462,9 @@ def main() -> int:
                             runtime_state,
                             request_id=(active_request or {}).get("request_id"),
                             motion_id=(active_request or {}).get("motion_id"),
-                            report_path=shared_log_path,
+                            report_path=(
+                                active_shared_report_path or shared_log_path
+                            ),
                             trace_path=shared_trace_path,
                             simulation_time_s=sample["simulation_time_s"],
                             root_height_m=root_height,
@@ -2276,6 +2503,13 @@ def main() -> int:
                             max_applied_torque_nm=max_applied_torque,
                             max_torque_limit_ratio=max_torque_ratio,
                             elastic_target_height_m=float(elastic_target_w[0, 2]),
+                            last_motion_id=last_motion_id,
+                            execution_count=execution_count,
+                            performance=(
+                                completed_performance
+                                if completed_waiting_for_idle
+                                else runtime_performance_base
+                            ),
                         )
 
                     if not finite:
@@ -2348,6 +2582,8 @@ def main() -> int:
                         )
                         break
                     if (
+                        not completed_waiting_for_idle
+                        and
                         shutdown_requested
                         and reference_playback_end_step is not None
                     ):
@@ -2361,7 +2597,27 @@ def main() -> int:
                             "[pipeline-sim] persistent SONIC execution completed "
                             "after monitored post-hold"
                         )
-                        break
+                        if args_cli.exit_after_command:
+                            break
+                        completed_performance = write_persistent_execution_report(now)
+                        completed_waiting_for_idle = True
+                        write_runtime_status(
+                            RuntimeState.COMPLETED.value,
+                            request_id=(active_request or {}).get("request_id"),
+                            motion_id=(active_request or {}).get("motion_id"),
+                            report_path=active_shared_report_path,
+                            trace_path=shared_trace_path,
+                            simulation_time_s=round(step_count * sim_step_s, 4),
+                            release_realtime_factor=release_realtime_factor,
+                            max_tracking_error_rad=max_tracking_error,
+                            max_command_position_error_rad=(
+                                max_command_position_error
+                            ),
+                            max_reference_root_height_error_m=(
+                                max_reference_root_height_error
+                            ),
+                            performance=completed_performance,
+                        )
                     if support_active and command_seen and not DIAGNOSTIC_MODE:
                         settle_elapsed_sim_s = (step_count - settle_start_step) * sim_step_s
                         if settle_elapsed_sim_s > args_cli.max_settle_duration:
