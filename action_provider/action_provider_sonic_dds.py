@@ -163,6 +163,10 @@ class SonicDDSActionProvider(ActionProvider):
         self._actual_q: torch.Tensor | None = None
         self._actual_dq: torch.Tensor | None = None
         self._stale_timeout_s = float(getattr(args_cli, "sonic_command_timeout", 0.25))
+        self._standing_stale_timeout_s = float(
+            getattr(args_cli, "standing_command_timeout", 1.0)
+        )
+        self._standing_idle = False
         self._reported_stale = False
         self._reported_pre_session_cmd = False
         self._fresh_command_times: deque[float] = deque(maxlen=4096)
@@ -355,7 +359,7 @@ class SonicDDSActionProvider(ActionProvider):
         if self._last_fresh_cmd:
             self._lowcmd_age_samples_ms.append(max(0.0, command_age_s) * 1000.0)
         command_stale = bool(
-            self._last_fresh_cmd and command_age_s > self._stale_timeout_s
+            self._last_fresh_cmd and command_age_s > self.command_timeout_s
         )
         bootstrap_hold = bool(
             not self._last_fresh_cmd
@@ -493,6 +497,19 @@ class SonicDDSActionProvider(ActionProvider):
         self._handoff_armed = False
         self._bootstrap_target_shaping_active = False
 
+    def set_standing_idle(self, enabled: bool) -> None:
+        """Select the bounded idle-standing DDS watchdog threshold."""
+
+        self._standing_idle = bool(enabled)
+
+    @property
+    def command_timeout_s(self) -> float:
+        return (
+            self._standing_stale_timeout_s
+            if self._standing_idle
+            else self._stale_timeout_s
+        )
+
     @property
     def has_fresh_command(self) -> bool:
         """Whether this simulator session has received a valid live LowCmd."""
@@ -507,7 +524,7 @@ class SonicDDSActionProvider(ActionProvider):
 
     @property
     def command_is_stale(self) -> bool:
-        return self.has_fresh_command and self.command_age_s > self._stale_timeout_s
+        return self.has_fresh_command and self.command_age_s > self.command_timeout_s
 
     @property
     def target_indices(self) -> torch.Tensor:
@@ -607,6 +624,8 @@ class SonicDDSActionProvider(ActionProvider):
                 list(self._lowcmd_age_samples_ms), 0.95
             ),
             "lowcmd_age_s": self.command_age_s if self.has_fresh_command else None,
+            "lowcmd_timeout_s": self.command_timeout_s,
+            "standing_idle": self._standing_idle,
             "control_handoff_duration_s": self._handoff_duration_s,
             "control_handoff_progress": self._handoff_progress,
             "control_handoff_armed": self._handoff_armed,

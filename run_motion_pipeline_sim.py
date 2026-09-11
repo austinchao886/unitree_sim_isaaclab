@@ -228,7 +228,18 @@ parser.add_argument(
     action="store_true",
     help="Run physics as fast as possible instead of pacing the 200 Hz servo to wall time",
 )
-parser.add_argument("--sonic-command-timeout", type=float, default=0.25)
+parser.add_argument(
+    "--sonic-command-timeout",
+    type=float,
+    default=0.5,
+    help="LowCmd timeout while settling or executing an approved motion",
+)
+parser.add_argument(
+    "--standing-command-timeout",
+    type=float,
+    default=1.0,
+    help="LowCmd timeout while the persistent controller is idle-standing",
+)
 parser.add_argument(
     "--bootstrap-support",
     choices=("elastic", "fixed", "none"),
@@ -559,6 +570,16 @@ if args_cli.replay_motion_id and not args_cli.replay_trace:
     parser.error("--replay-motion-id requires --replay-trace")
 if args_cli.video_quality_profile == "offline-high" and not args_cli.replay_trace:
     parser.error("--video-quality-profile offline-high requires --replay-trace")
+if not math.isfinite(args_cli.sonic_command_timeout) or args_cli.sonic_command_timeout <= 0.0:
+    parser.error("--sonic-command-timeout must be finite and positive")
+if (
+    not math.isfinite(args_cli.standing_command_timeout)
+    or args_cli.standing_command_timeout < args_cli.sonic_command_timeout
+):
+    parser.error(
+        "--standing-command-timeout must be finite and at least "
+        "--sonic-command-timeout"
+    )
 for name in (
     "release_delay",
     "release_stable_duration",
@@ -1768,6 +1789,7 @@ def main() -> int:
                                     None if support_active else 1.0
                                 )
                                 unsafe_reason = None
+                                provider.set_standing_idle(False)
                                 active_request = candidate
                                 try:
                                     reference_root_heights = [
@@ -1868,6 +1890,7 @@ def main() -> int:
                             playback_gate_step = None
                             post_release_stable_start_step = None
                             bootstrap_phase = "READY_STANDING"
+                            provider.set_standing_idle(True)
                             write_runtime_status(
                                 RuntimeState.READY_STANDING.value,
                                 last_motion_id=last_motion_id,
