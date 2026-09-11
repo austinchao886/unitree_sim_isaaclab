@@ -1931,9 +1931,12 @@ def main() -> int:
                             preempt_request = control_request
                             support_active = support_mode != "none"
                             support_scale = 1.0 if support_active else 0.0
-                            support_attitude_scale = (
-                                1.0 if support_active else 0.0
-                            )
+                            # Runtime preemption mirrors the planned physical
+                            # suspension: restore vertical fall protection but
+                            # leave XY and attitude under SONIC authority. A
+                            # full 6-DoF band fights the already-active balance
+                            # policy and prevents the neutral gate converging.
+                            support_attitude_scale = 0.0
                             support_release_step_target = None
                             support_release_step = None
                             support_stable_start_step = None
