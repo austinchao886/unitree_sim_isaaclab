@@ -1507,6 +1507,7 @@ def main() -> int:
         lowstate_interval_steps = max(1, round(1.0 / (50.0 * sim_step_s)))
         trace_interval_steps = max(1, round(1.0 / (max(args_cli.trace_hz, 1.0) * sim_step_s)))
         command_seen = False
+        interactive_mode = False
         max_tracking_error = 0.0
         max_tracking_joint = None
         max_tracking_step = None
@@ -1712,7 +1713,51 @@ def main() -> int:
                                 result = "UNSAFE"
                                 print(f"[pipeline-sim] UNSAFE: {unsafe_reason}")
                                 break
-                            if candidate.get("state") in {
+                            if candidate.get("state") == "INTERACTIVE":
+                                if candidate.get("isaac_session_id") != session_id:
+                                    unsafe_reason = (
+                                        "interactive request targets a different "
+                                        "Isaac session"
+                                    )
+                                    result = "UNSAFE"
+                                    print(f"[pipeline-sim] UNSAFE: {unsafe_reason}")
+                                    break
+                                if candidate.get("asset_profile") != ASSET_PROFILE.profile_id:
+                                    unsafe_reason = (
+                                        "interactive request asset profile mismatch: "
+                                        f"expected={ASSET_PROFILE.profile_id}, "
+                                        f"actual={candidate.get('asset_profile')}"
+                                    )
+                                    result = "UNSAFE"
+                                    print(f"[pipeline-sim] UNSAFE: {unsafe_reason}")
+                                    break
+                                interactive_mode = True
+                                active_request = candidate
+                                provider.set_standing_idle(False)
+                                settle_start_wall = now
+                                settle_start_step = step_count
+                                playback_gate_step = None
+                                post_release_stable_start_step = None
+                                provider.begin_control_handoff()
+                                bootstrap_phase = (
+                                    "SUPPORTED_WARMUP"
+                                    if support_active
+                                    else "INTERACTIVE_GROUNDING"
+                                )
+                                write_runtime_status(
+                                    "SETTLING" if support_active else "GROUNDING",
+                                    request_id=candidate.get("request_id"),
+                                    motion_id=candidate.get("motion_id"),
+                                    interactive_source=candidate.get("interactive_source"),
+                                    bootstrap_phase=bootstrap_phase,
+                                    control_handoff_progress=provider.handoff_progress,
+                                )
+                                print(
+                                    "[pipeline-sim] accepted interactive SONIC "
+                                    "joystick/planner runtime",
+                                    flush=True,
+                                )
+                            elif candidate.get("state") in {
                                 "STARTING", "IDLE", "STOPPING"
                             }:
                                 # SONIC publishes its INIT-ramp command before the
@@ -1790,6 +1835,7 @@ def main() -> int:
                                 )
                                 unsafe_reason = None
                                 provider.set_standing_idle(False)
+                                interactive_mode = False
                                 active_request = candidate
                                 try:
                                     reference_root_heights = [
@@ -1864,6 +1910,31 @@ def main() -> int:
                         except (FileNotFoundError, json.JSONDecodeError):
                             control_request = {}
                         if (
+                            interactive_mode
+                            and control_request.get("state") == "SETTLING"
+                            and control_request.get("isaac_session_id") == session_id
+                        ):
+                            # An approved offline reference preempts joystick
+                            # locomotion without restarting Isaac or SONIC. The
+                            # regular SETTLING admission path runs next tick.
+                            interactive_mode = False
+                            command_seen = False
+                            active_request = None
+                            playback_gate_step = None
+                            post_release_stable_start_step = None
+                            reference_root_heights = []
+                            reference_joint_positions = []
+                            reference_joint_tensor = None
+                            expected_reference_root_height = None
+                            reference_root_height_error = None
+                            provider.set_standing_idle(False)
+                            bootstrap_phase = "REFERENCE_PREEMPT"
+                            print(
+                                "[pipeline-sim] approved reference preempted "
+                                "interactive joystick mode",
+                                flush=True,
+                            )
+                        elif (
                             completed_waiting_for_idle
                             and control_request.get("state") == "IDLE"
                             and active_request is not None
@@ -1874,6 +1945,7 @@ def main() -> int:
                             last_motion_id = str(active_request.get("motion_id"))
                             completed_waiting_for_idle = False
                             command_seen = False
+                            interactive_mode = False
                             shutdown_requested = False
                             active_request = None
                             playback_start_step = None
@@ -2284,16 +2356,23 @@ def main() -> int:
                             ) * sim_step_s
                             if stable_sim_s >= args_cli.unsupported_stable_duration:
                                 playback_gate_step = step_count
-                                bootstrap_phase = "UNSUPPORTED_QUIET"
+                                bootstrap_phase = (
+                                    "INTERACTIVE"
+                                    if interactive_mode
+                                    else "UNSUPPORTED_QUIET"
+                                )
                                 provider.end_control_handoff()
                                 print(
                                     "[pipeline-sim] unsupported ground gate passed "
                                     f"after {stable_sim_s:.2f}s stable"
                                 )
                                 write_runtime_status(
-                                    "EXECUTING",
+                                    "INTERACTIVE" if interactive_mode else "EXECUTING",
                                     request_id=active_request.get("request_id"),
                                     motion_id=active_request.get("motion_id"),
+                                    interactive_source=active_request.get(
+                                        "interactive_source"
+                                    ),
                                     release_realtime_factor=release_realtime_factor,
                                     reference_clock="lowstate_tick",
                                     simulation_time_s=round(step_count * sim_step_s, 4),
@@ -2471,7 +2550,17 @@ def main() -> int:
                         if completed_waiting_for_idle:
                             runtime_state = RuntimeState.COMPLETED.value
                         elif command_seen:
-                            if shutdown_requested:
+                            if interactive_mode:
+                                runtime_state = (
+                                    "INTERACTIVE"
+                                    if playback_gate_step is not None
+                                    else (
+                                        "SETTLING"
+                                        if support_active
+                                        else "GROUNDING"
+                                    )
+                                )
+                            elif shutdown_requested:
                                 runtime_state = "STOPPING"
                             elif post_hold_ready_reported:
                                 runtime_state = "POST_HOLD_COMPLETE"
