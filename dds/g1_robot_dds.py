@@ -5,6 +5,7 @@ G1 robot DDS communication class
 Handle the state publishing and command receiving of the G1 robot
 """
 
+import json
 import numpy as np
 import os
 import threading
@@ -15,6 +16,8 @@ from typing import Any, Dict, Optional
 from dds.dds_base import DDSObject
 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import IMUState_, LowState_, LowCmd_
+from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
+from motion_pipeline.joystick import encode_unitree_remote, parse_command
 from unitree_sdk2py.idl.default import (
     unitree_hg_msg_dds__IMUState_,
     unitree_hg_msg_dds__LowCmd_,
@@ -51,6 +54,18 @@ class G1RobotDDS(DDSObject):
         self.secondary_imu_topic = os.getenv(
             "SIM_SECONDARY_IMU_TOPIC", "rt/socialnav_sim/g1/secondary_imu"
         )
+        self.joystick_topic = os.getenv(
+            "SIM_JOYSTICK_TOPIC", "rt/motion/joystick/cmd"
+        )
+        self.joystick_stale_after_s = float(
+            os.getenv("SIM_JOYSTICK_STALE_AFTER_S", "0.2")
+        )
+        self._joystick_lock = threading.Lock()
+        self._latest_joystick = None
+        self._latest_joystick_received_at = 0.0
+        self._joystick_session = None
+        self._joystick_sequence = -1
+        self._joystick_stale_reported = False
         self._reported_command_write_failure = False
         self._in_process_fast_path = os.getenv(
             "SIM_DDS_IN_PROCESS_FAST_PATH", "1"
@@ -141,6 +156,12 @@ class G1RobotDDS(DDSObject):
             self.subscriber = ChannelSubscriber(self.lowcmd_topic, LowCmd_)
             self.subscriber.Init(lambda msg: self.dds_subscriber(msg, ""), 32)
             print(f"[{self.node_name}] Command subscriber initialized ({self.lowcmd_topic})")
+            self.joystick_subscriber = ChannelSubscriber(self.joystick_topic, String_)
+            self.joystick_subscriber.Init(self._joystick_subscriber, 8)
+            print(
+                f"[{self.node_name}] Simulation joystick subscriber initialized "
+                f"({self.joystick_topic})"
+            )
             return True
         except Exception as e:
             print(f"g1_robot_dds [{self.node_name}] Command subscriber initialization failed: {e}")
@@ -195,6 +216,25 @@ class G1RobotDDS(DDSObject):
 
                 imu_state.gyroscope[:] = imu_array[10:13]
 
+            # The simulator remains the sole LowState publisher. A dedicated,
+            # loopback-only application topic supplies only the 40-byte remote
+            # field so a Mac-connected PS4 controller cannot impersonate robot
+            # state or publish on the physical LowState topic.
+            with self._joystick_lock:
+                command = self._latest_joystick
+                command_age = time.monotonic() - self._latest_joystick_received_at
+            if command is None or command_age > self.joystick_stale_after_s:
+                self.low_state.wireless_remote[:] = encode_unitree_remote(None)
+                if command is not None and not self._joystick_stale_reported:
+                    print(
+                        f"[{self.node_name}] Joystick stale after "
+                        f"{command_age:.3f}s; forcing deadman release"
+                    )
+                    self._joystick_stale_reported = True
+            else:
+                self.low_state.wireless_remote[:] = encode_unitree_remote(command)
+                self._joystick_stale_reported = False
+
             # In simulator mode the LowState tick is the authoritative physics
             # step, not a publisher-thread counter.  The DDS publisher may run
             # many times while Isaac is still rendering one physics step; using
@@ -224,6 +264,22 @@ class G1RobotDDS(DDSObject):
 
         except Exception as e:
             print(f"g1_robot_dds [{self.node_name}] Error processing publish data: {e}")
+
+    def _joystick_subscriber(self, msg: String_) -> None:
+        """Accept a validated, monotonically sequenced simulation command."""
+        try:
+            payload = json.loads(msg.data)
+            command = parse_command(payload)
+            session = str(payload["bridge_session"])
+            with self._joystick_lock:
+                if session == self._joystick_session and command.sequence <= self._joystick_sequence:
+                    return
+                self._joystick_session = session
+                self._joystick_sequence = command.sequence
+                self._latest_joystick = command
+                self._latest_joystick_received_at = time.monotonic()
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            print(f"[{self.node_name}] Rejected simulation joystick command: {exc}")
 
     
     def dds_subscriber(self, msg: LowCmd_,datatype:str=None) -> Dict[str, Any]:
