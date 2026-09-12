@@ -2109,15 +2109,22 @@ def main() -> int:
                         break
                     if (
                         not args_cli.exit_after_command
-                        and execution_count > 0
+                        and (execution_count > 0 or interactive_mode)
                         and provider.command_is_stale
                     ):
-                        result = "UNSAFE"
+                        # A persistent interactive controller is just as
+                        # safety-critical as offline reference playback.  If
+                        # SONIC exits or is recreated, do not keep applying its
+                        # last cached LowCmd while the robot is unsupported.
+                        # End this generation immediately; the runner service
+                        # will start a clean, supported session and the SONIC
+                        # supervisor will reconnect to it.
+                        result = "SAFE_STOP"
                         unsafe_reason = (
                             "persistent SONIC LowCmd stream became stale: "
                             f"age={provider.command_age_s:.3f}s"
                         )
-                        print(f"[pipeline-sim] UNSAFE: {unsafe_reason}")
+                        print(f"[pipeline-sim] SAFE_STOP: {unsafe_reason}")
                         write_runtime_status(
                             RuntimeState.SAFE_STOP.value,
                             request_id=(active_request or {}).get("request_id"),
