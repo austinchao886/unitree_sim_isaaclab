@@ -1913,6 +1913,31 @@ def main() -> int:
                             control_request = {}
                         if (
                             interactive_mode
+                            and control_request.get("state") == "STARTING"
+                            and control_request.get("isaac_session_id") == session_id
+                        ):
+                            # A fresh supervisor must never inherit an already
+                            # unsupported interactive physics session.  Its
+                            # first INIT commands can arrive before the LowCmd
+                            # stale timeout and would otherwise look like a
+                            # continuation of the old controller.  End this
+                            # generation explicitly so the persistent runner
+                            # restarts with bootstrap support engaged.
+                            result = "SAFE_STOP"
+                            unsafe_reason = (
+                                "fresh SONIC supervisor requested interactive "
+                                "bootstrap"
+                            )
+                            print(f"[pipeline-sim] {unsafe_reason}", flush=True)
+                            write_runtime_status(
+                                RuntimeState.SAFE_STOP.value,
+                                request_id=control_request.get("request_id"),
+                                motion_id=control_request.get("motion_id"),
+                                reason=unsafe_reason,
+                            )
+                            break
+                        elif (
+                            interactive_mode
                             and control_request.get("state")
                                 == "REFERENCE_PREEMPT"
                             and control_request.get("isaac_session_id") == session_id
