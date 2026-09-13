@@ -1427,6 +1427,7 @@ def main() -> int:
         fade_velocity_violation_steps = 0
         support_scale = 1.0 if support_active else 0.0
         support_attitude_scale = 1.0 if support_active else 0.0
+        support_attitude_fade_initial_scale = support_attitude_scale
         bootstrap_phase = "IDLE_SUPPORTED" if support_active else "UNSUPPORTED"
         post_release_stable_start_step = None
         playback_gate_step = None
@@ -2187,9 +2188,12 @@ def main() -> int:
                                 fade_elapsed_s = (
                                     step_count - support_fade_start_step
                                 ) * sim_step_s
-                                support_attitude_scale = elastic_support_scale(
-                                    fade_elapsed_s,
-                                    args_cli.support_attitude_fade_duration,
+                                support_attitude_scale = (
+                                    support_attitude_fade_initial_scale
+                                    * elastic_support_scale(
+                                        fade_elapsed_s,
+                                        args_cli.support_attitude_fade_duration,
+                                    )
                                 )
                                 vertical_fade_elapsed_s = max(
                                     0.0,
@@ -2957,6 +2961,13 @@ def main() -> int:
                                 )
                             ):
                                 support_fade_start_step = step_count
+                                # Reference preemption reacquires only vertical
+                                # support. Never re-enable XY/attitude restraint
+                                # when starting its release, especially after
+                                # locomotion has changed the robot's heading.
+                                support_attitude_fade_initial_scale = (
+                                    support_attitude_scale
+                                )
                                 bootstrap_phase = "SUPPORT_FADE"
                                 print(
                                     "[pipeline-sim] supported warm-up envelope passed; "
