@@ -19,7 +19,10 @@ class SolverIterationTests(unittest.TestCase):
             return namespace['_solver_iterations']()
 
     def test_defaults(self):
-        self.assertEqual(self.resolve(), (8, 4))
+        self.assertEqual(self.resolve(), (8, 1))
+
+    def test_previous_eight_four_configuration_remains_available(self):
+        self.assertEqual(self.resolve(G1_DEPLOYMENT_SOLVER_VELOCITY_ITERS='4'), (8, 4))
 
     def test_baseline_override(self):
         self.assertEqual(self.resolve(G1_DEPLOYMENT_SOLVER_POSITION_ITERS='4',
