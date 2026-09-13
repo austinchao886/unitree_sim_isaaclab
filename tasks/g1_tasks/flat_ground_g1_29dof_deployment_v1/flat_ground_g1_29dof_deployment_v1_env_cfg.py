@@ -57,8 +57,8 @@ INSPIRE_HAND_JOINTS = (
 def _solver_iterations() -> tuple[int, int]:
     """Resolve bounded A/B knobs; production defaults remain explicit."""
 
-    position = int(os.getenv("G1_DEPLOYMENT_SOLVER_POSITION_ITERS", "4"))
-    velocity = int(os.getenv("G1_DEPLOYMENT_SOLVER_VELOCITY_ITERS", "1"))
+    position = int(os.getenv("G1_DEPLOYMENT_SOLVER_POSITION_ITERS", "8"))
+    velocity = int(os.getenv("G1_DEPLOYMENT_SOLVER_VELOCITY_ITERS", "4"))
     if not 4 <= position <= 8:
         raise ValueError("G1_DEPLOYMENT_SOLVER_POSITION_ITERS must be within [4, 8]")
     if not 1 <= velocity <= 4:

@@ -837,6 +837,33 @@ def scripted_critical_metrics(
     )
 
 
+def resolve_tgs_force_integration(profile_id: str) -> bool:
+    """Keep the setting scoped to the deployment profile; allow explicit A/B."""
+    default = "1" if profile_id == "g1_deployment_v1" else "0"
+    value = os.getenv("SONIC_TGS_FORCES_EVERY_ITERATION", default)
+    if value not in ("0", "1"):
+        raise ValueError("SONIC_TGS_FORCES_EVERY_ITERATION must be 0 or 1")
+    return value == "1"
+
+
+def configure_tgs_force_integration(physics_prim_path: str, enabled: bool) -> None:
+    """Author before scene startup; older Isaac Lab lacks a config field.
+
+    TGS can otherwise report non-zero steady-state joint velocities when
+    external forces are integrated once per frame but constraints per substep.
+    Use the installed PhysX schema, not a post-hoc velocity filter.
+    """
+    import isaacsim.core.utils.stage as stage_utils
+    from pxr import PhysxSchema, UsdPhysics
+
+    stage = stage_utils.get_current_stage()
+    if stage is None:
+        stage = stage_utils.create_new_stage()
+    scene = UsdPhysics.Scene.Define(stage, physics_prim_path)
+    api = PhysxSchema.PhysxSceneAPI.Apply(scene.GetPrim())
+    api.CreateEnableExternalForcesEveryIterationAttr(enabled)
+
+
 def qualified_sonic_step(env, action: torch.Tensor) -> None:
     """Run the qualified zero-reward task without unused RL bookkeeping.
 
@@ -945,6 +972,7 @@ def main() -> int:
     shared_trace_path = f"/motion_exchange/executions/{trace_path.name}"
     session_id = uuid.uuid4().hex
     runtime_performance_base: dict = {}
+    tgs_external_forces_every_iteration = False
 
     def write_runtime_status(state: str, **values) -> None:
         if "performance" not in values and runtime_performance_base:
@@ -957,6 +985,7 @@ def main() -> int:
             "asset_profile": ASSET_PROFILE.profile_id,
             "asset_profile_qualified": ASSET_PROFILE.qualified,
             "diagnostic_only": DIAGNOSTIC_MODE,
+            "tgs_external_forces_every_iteration": tgs_external_forces_every_iteration,
             "updated_epoch_s": time.time(),
             **values,
         }
@@ -981,8 +1010,25 @@ def main() -> int:
             )
         else:
             env_cfg.sim.render_interval = max(1, int(args_cli.render_interval))
+        requested_tgs_force_integration = resolve_tgs_force_integration(
+            ASSET_PROFILE.profile_id
+        )
+        configure_tgs_force_integration(
+            env_cfg.sim.physics_prim_path, requested_tgs_force_integration
+        )
         print("[pipeline-sim] creating Isaac environment", flush=True)
         env = gym.make(TASK_NAME, cfg=env_cfg).unwrapped
+        from pxr import PhysxSchema
+        import isaacsim.core.utils.stage as stage_utils
+        scene_api = PhysxSchema.PhysxSceneAPI(
+            stage_utils.get_current_stage().GetPrimAtPath(env_cfg.sim.physics_prim_path)
+        )
+        tgs_external_forces_every_iteration = bool(
+            scene_api.GetEnableExternalForcesEveryIterationAttr().Get()
+        )
+        if tgs_external_forces_every_iteration != requested_tgs_force_integration:
+            raise RuntimeError("PhysX did not retain requested TGS force-integration setting")
+        print(f"[pipeline-sim] TGS external forces every iteration={tgs_external_forces_every_iteration}", flush=True)
         env._sonic_rendering_enabled = env.sim.has_gui() or env.sim.has_rtx_sensors()
         print("[pipeline-sim] resetting SimulationContext", flush=True)
         env.sim.reset()
@@ -3351,11 +3397,14 @@ def main() -> int:
                 "qualified_zero_manager_step": True,
                 "visual_state_output": args_cli.visual_state_output,
                 "solver_position_iteration_count": (
-                    ASSET_PROFILE.solver_position_iteration_count
+                    env_cfg.scene.robot.spawn.articulation_props.solver_position_iteration_count
+                    if "env_cfg" in locals() else None
                 ),
                 "solver_velocity_iteration_count": (
-                    ASSET_PROFILE.solver_velocity_iteration_count
+                    env_cfg.scene.robot.spawn.articulation_props.solver_velocity_iteration_count
+                    if "env_cfg" in locals() else None
                 ),
+                "tgs_external_forces_every_iteration": tgs_external_forces_every_iteration,
             },
         }
         report = {
