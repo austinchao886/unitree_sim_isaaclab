@@ -1717,14 +1717,12 @@ def main() -> int:
                                 break
                             if candidate.get("state") == "INTERACTIVE":
                                 if candidate.get("isaac_session_id") != session_id:
-                                    unsafe_reason = (
-                                        "interactive request targets a different "
-                                        "Isaac session"
-                                    )
-                                    result = "UNSAFE"
-                                    print(f"[pipeline-sim] UNSAFE: {unsafe_reason}")
-                                    break
-                                if candidate.get("asset_profile") != ASSET_PROFILE.profile_id:
+                                    # The persistent runner can become READY
+                                    # before the supervisor notices the new
+                                    # session. Keep bootstrap support active
+                                    # while that stale request is replaced.
+                                    command_seen = False
+                                elif candidate.get("asset_profile") != ASSET_PROFILE.profile_id:
                                     unsafe_reason = (
                                         "interactive request asset profile mismatch: "
                                         f"expected={ASSET_PROFILE.profile_id}, "
@@ -1733,32 +1731,33 @@ def main() -> int:
                                     result = "UNSAFE"
                                     print(f"[pipeline-sim] UNSAFE: {unsafe_reason}")
                                     break
-                                interactive_mode = True
-                                active_request = candidate
-                                provider.set_standing_idle(False)
-                                settle_start_wall = now
-                                settle_start_step = step_count
-                                playback_gate_step = None
-                                post_release_stable_start_step = None
-                                provider.begin_control_handoff()
-                                bootstrap_phase = (
-                                    "SUPPORTED_WARMUP"
-                                    if support_active
-                                    else "INTERACTIVE_GROUNDING"
-                                )
-                                write_runtime_status(
-                                    "SETTLING" if support_active else "GROUNDING",
-                                    request_id=candidate.get("request_id"),
-                                    motion_id=candidate.get("motion_id"),
-                                    interactive_source=candidate.get("interactive_source"),
-                                    bootstrap_phase=bootstrap_phase,
-                                    control_handoff_progress=provider.handoff_progress,
-                                )
-                                print(
-                                    "[pipeline-sim] accepted interactive SONIC "
-                                    "joystick/planner runtime",
-                                    flush=True,
-                                )
+                                else:
+                                    interactive_mode = True
+                                    active_request = candidate
+                                    provider.set_standing_idle(False)
+                                    settle_start_wall = now
+                                    settle_start_step = step_count
+                                    playback_gate_step = None
+                                    post_release_stable_start_step = None
+                                    provider.begin_control_handoff()
+                                    bootstrap_phase = (
+                                        "SUPPORTED_WARMUP"
+                                        if support_active
+                                        else "INTERACTIVE_GROUNDING"
+                                    )
+                                    write_runtime_status(
+                                        "SETTLING" if support_active else "GROUNDING",
+                                        request_id=candidate.get("request_id"),
+                                        motion_id=candidate.get("motion_id"),
+                                        interactive_source=candidate.get("interactive_source"),
+                                        bootstrap_phase=bootstrap_phase,
+                                        control_handoff_progress=provider.handoff_progress,
+                                    )
+                                    print(
+                                        "[pipeline-sim] accepted interactive SONIC "
+                                        "joystick/planner runtime",
+                                        flush=True,
+                                    )
                             elif candidate.get("state") in {
                                 "STARTING", "IDLE", "STOPPING"
                             }:
@@ -1774,10 +1773,11 @@ def main() -> int:
                                 print(f"[pipeline-sim] UNSAFE: {unsafe_reason}")
                                 break
                             elif candidate.get("isaac_session_id") != session_id:
-                                unsafe_reason = "runtime request targets a different Isaac session"
-                                result = "UNSAFE"
-                                print(f"[pipeline-sim] UNSAFE: {unsafe_reason}")
-                                break
+                                # This can be an approved request from the
+                                # previous generation. Do not admit it into a
+                                # new physics session; wait under support for
+                                # the supervisor to republish against this one.
+                                command_seen = False
                             elif candidate.get("asset_profile") != ASSET_PROFILE.profile_id:
                                 unsafe_reason = (
                                     "runtime request asset profile mismatch: "
