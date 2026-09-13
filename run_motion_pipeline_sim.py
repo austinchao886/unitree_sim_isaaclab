@@ -1914,10 +1914,13 @@ def main() -> int:
                         if (
                             interactive_mode
                             and control_request.get("state") == "STARTING"
+                            and control_request.get("request_id") == "interactive-bootstrap"
                             and control_request.get("isaac_session_id") == session_id
                         ):
                             # A fresh supervisor must never inherit an already
-                            # unsupported interactive physics session.  Its
+                            # unsupported interactive physics session. Normal
+                            # reference approvals also use STARTING and must
+                            # proceed to REFERENCE_PREEMPT instead. Its
                             # first INIT commands can arrive before the LowCmd
                             # stale timeout and would otherwise look like a
                             # continuation of the old controller.  End this
