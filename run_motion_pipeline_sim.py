@@ -1740,7 +1740,16 @@ def main() -> int:
                                     settle_start_step = step_count
                                     playback_gate_step = None
                                     post_release_stable_start_step = None
-                                    provider.begin_control_handoff()
+                                    if support_active:
+                                        provider.begin_control_handoff()
+                                    else:
+                                        # Warm reference -> planner switches
+                                        # retain the same live SONIC controller.
+                                        # Do not re-arm cold-start torque blending,
+                                        # target shaping, or extra damping after
+                                        # unsupported standing was qualified.
+                                        # Keep the ground gate and DDS watchdog.
+                                        provider.end_control_handoff()
                                     bootstrap_phase = (
                                         "SUPPORTED_WARMUP"
                                         if support_active
