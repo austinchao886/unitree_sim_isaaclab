@@ -210,6 +210,10 @@ parser.add_argument(
 parser.add_argument("--stats-interval", type=float, default=1.0)
 parser.add_argument("--trace-hz", type=float, default=50.0)
 parser.add_argument(
+    "--foot-contact-trace", action="store_true",
+    help="Opt-in two-foot contact/link-state diagnostics; benchmark overhead before acceptance",
+)
+parser.add_argument(
     "--visual-state-output",
     default=os.getenv("SIM_VISUAL_STATE_PATH"),
     help=(
@@ -656,6 +660,7 @@ isaac_math.quat_rotate = isaac_math.quat_apply
 
 import tasks  # noqa: F401  Registers the environment.
 from action_provider.action_provider_sonic_dds import G1_MOTOR_JOINTS, SonicDDSActionProvider
+from action_provider.kinematic_window import KinematicWindow
 from dds.dds_master import dds_manager
 from dds.g1_robot_dds import G1RobotDDS
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
@@ -833,6 +838,8 @@ def scripted_critical_metrics(
             max_torque_index.to(root_state.dtype),
             torque_ratio[max_torque_ratio_index],
             max_torque_ratio_index.to(root_state.dtype),
+            root_state[7],
+            root_state[8],
         )
     )
 
@@ -1002,7 +1009,15 @@ def main() -> int:
         # tensors.  Disabling the unused ContactSensor leaves physical contact,
         # friction, and collision response intact while avoiding a per-step GPU
         # contact-report copy that alone prevents 0.8x headless realtime.
-        env_cfg.scene.contact_forces = None
+        if args_cli.foot_contact_trace:
+            from isaaclab.sensors import ContactSensorCfg
+            env_cfg.scene.contact_forces = ContactSensorCfg(
+                prim_path="/World/envs/env_.*/Robot/.*ankle_roll_link",
+                history_length=1, track_air_time=False, debug_vis=False,
+                update_period=env_cfg.sim.dt,
+            )
+        else:
+            env_cfg.scene.contact_forces = None
         if args_cli.video:
             video_step_s = float(env_cfg.sim.dt * env_cfg.decimation)
             env_cfg.sim.render_interval = max(
@@ -1240,6 +1255,17 @@ def main() -> int:
         names = list(robot.data.joint_names)
         ASSET_PROFILE.assert_articulation(names)
         body_names = list(robot.data.body_names)
+        foot_trace_names = ("left_ankle_roll_link", "right_ankle_roll_link")
+        foot_trace_ids = None
+        foot_contact_ids = None
+        foot_contact_sensor = None
+        if args_cli.foot_contact_trace:
+            # Resolve articulation and sensor order independently. Missing links
+            # are an explicit diagnostic setup error, never silently mislabelled.
+            foot_trace_ids = [body_names.index(name) for name in foot_trace_names]
+            foot_contact_sensor = env.scene["contact_forces"]
+            sensor_names = list(foot_contact_sensor.body_names)
+            foot_contact_ids = [sensor_names.index(name) for name in foot_trace_names]
         if ASSET_PROFILE.body_mass_override_kg:
             body_index = {name: index for index, name in enumerate(body_names)}
             missing_body_overrides = sorted(
@@ -1548,6 +1574,7 @@ def main() -> int:
             )
 
         step_count = 0
+        kinematic_window = KinematicWindow(session_id)
         sim_step_s = float(env_cfg.sim.dt * env_cfg.decimation)
         video_capture_interval_steps = max(
             1, round(1.0 / (args_cli.video_fps * sim_step_s))
@@ -2412,6 +2439,9 @@ def main() -> int:
                     max_applied_torque_joint = G1_MOTOR_JOINTS[max_torque_index]
                     max_torque_ratio = packed_metrics[17]
                     max_torque_ratio_index = int(packed_metrics[18])
+                    kinematic_window.add(step_count * sim_step_s,
+                        [packed_metrics[19],packed_metrics[20],packed_metrics[1]],
+                        root_height,root_tilt,max_torque_ratio)
                     max_torque_ratio_joint = G1_MOTOR_JOINTS[
                         max_torque_ratio_index
                     ]
@@ -2630,6 +2660,27 @@ def main() -> int:
                             "shutdown_requested": shutdown_requested,
                             "max_joint_velocity_limit_ratio": max_velocity_ratio,
                         }
+                        trace["lowcmd_age_s"] = provider.command_age_s
+                        trace["command_timing_cumulative"] = provider.command_timing.snapshot()
+                        if foot_contact_sensor is not None:
+                            # Raw link kinematics + measured contact force. A
+                            # moving foot-link origin is not itself sole slip;
+                            # analysis must account for rotation/contact geometry.
+                            foot_values = torch.cat((
+                                robot.data.body_link_pos_w[0, foot_trace_ids],
+                                robot.data.body_link_quat_w[0, foot_trace_ids],
+                                robot.data.body_link_lin_vel_w[0, foot_trace_ids],
+                                robot.data.body_link_ang_vel_w[0, foot_trace_ids],
+                                foot_contact_sensor.data.net_forces_w[0, foot_contact_ids],
+                            ), dim=-1).detach().cpu().tolist()
+                            trace["foot_contact_measurements"] = {
+                                "schema_version": 1,
+                                "body_names": list(foot_trace_names),
+                                "world_frame": True,
+                                "columns": ["pos_xyz_m", "quat_wxyz", "lin_vel_xyz_m_s",
+                                            "ang_vel_xyz_rad_s", "net_contact_force_xyz_n"],
+                                "rows": foot_values,
+                            }
                         trace_handle.write(json.dumps(trace, separators=(",", ":")) + "\n")
 
                     if now >= next_stats:
@@ -2775,6 +2826,7 @@ def main() -> int:
                                 provider.bootstrap_damping_multiplier
                             ),
                             max_joint_velocity_rad_s=max_dq,
+                            kinematic_window=kinematic_window.snapshot(),
                             max_target_rate_rad_s=target_rate_rad_s,
                             max_applied_torque_nm=max_applied_torque,
                             max_torque_limit_ratio=max_torque_ratio,
@@ -3393,7 +3445,8 @@ def main() -> int:
                     else None
                 ),
                 "video_capture_enabled": bool(args_cli.video),
-                "unused_contact_sensor_disabled": True,
+                "unused_contact_sensor_disabled": not args_cli.foot_contact_trace,
+                "foot_contact_trace_enabled": args_cli.foot_contact_trace,
                 "qualified_zero_manager_step": True,
                 "visual_state_output": args_cli.visual_state_output,
                 "solver_position_iteration_count": (

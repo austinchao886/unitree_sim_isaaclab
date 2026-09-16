@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from action_provider.action_base import ActionProvider
+from action_provider.command_timing import CommandTiming
 from dds.dds_master import dds_manager
 
 
@@ -170,6 +171,7 @@ class SonicDDSActionProvider(ActionProvider):
         self._reported_stale = False
         self._reported_pre_session_cmd = False
         self._fresh_command_times: deque[float] = deque(maxlen=4096)
+        self.command_timing = CommandTiming()
         self._lowcmd_age_samples_ms: deque[float] = deque(maxlen=20000)
         self._lowcmd_host = np.empty((5, 29), dtype=np.float32)
         self._lowcmd_host_tensor = torch.from_numpy(self._lowcmd_host)
@@ -346,6 +348,7 @@ class SonicDDSActionProvider(ActionProvider):
                     self._lowcmd_device.copy_(self._lowcmd_host_tensor)
                     self._last_fresh_cmd = received_at
                     self._fresh_command_times.append(received_at)
+                    self.command_timing.accept(received_at)
                     self._last_q_des = self._q_des_device
                     self._last_dq_des = self._dq_des_device
                     self._last_tau_ff = self._tau_ff_device
@@ -358,6 +361,7 @@ class SonicDDSActionProvider(ActionProvider):
         )
         if self._last_fresh_cmd:
             self._lowcmd_age_samples_ms.append(max(0.0, command_age_s) * 1000.0)
+            self.command_timing.observe_age(max(0.0, command_age_s))
         command_stale = bool(
             self._last_fresh_cmd and command_age_s > self.command_timeout_s
         )
@@ -615,6 +619,7 @@ class SonicDDSActionProvider(ActionProvider):
         span_s = timestamps[-1] - timestamps[0] if len(timestamps) > 1 else 0.0
         return {
             "accepted_lowcmd_count": len(timestamps),
+            "command_timing_cumulative": self.command_timing.snapshot(),
             "lowcmd_receive_rate_hz": (
                 (len(timestamps) - 1) / span_s if span_s > 0.0 else None
             ),
